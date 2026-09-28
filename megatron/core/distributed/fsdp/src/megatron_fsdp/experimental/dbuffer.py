@@ -15,6 +15,7 @@
 """Distributed tensor buffers for Megatron-FSDP."""
 
 import dataclasses
+import warnings
 from collections.abc import Iterable
 
 import torch
@@ -41,6 +42,13 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
     for placement in placements:
         if not isinstance(placement, (Replicate, Partial, Shard)):
             raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
+
+        if isinstance(placement, TensorAtomic) and len(placements) > 1:
+            raise NotImplementedError(
+                "Currently, DBuffer only supports only 1d device mesh, "
+                f"but got ndim={len(placements)}."
+            )
+
         if isinstance(placement, Shard):
             if placement.dim != 0:
                 raise NotImplementedError(
@@ -472,15 +480,36 @@ class DBuffer:
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
-        # Symmetric-memory registration is scoped to the collective's process
-        # group, so rendezvous the output on the same mesh axis as the all-gather.
-        if out.is_symmetric_memory:
-            out.rendezvous(mesh_axis)
-        dist.all_gather_into_tensor(
-            output_tensor=out.local_buffer,
-            input_tensor=self.local_buffer,
-            group=self.mesh.get_group(mesh_axis),
-        )
+        group = self.mesh.get_group(mesh_axis)
+        if self.layout.has_equal_shard_sizes:
+            # PyTorch's NCCL all_gather uses a temporary buffer for equal-size
+            # inputs, then copies into the outputs. Gather directly into out to
+            # avoid that copy and preserve its symmetric-memory registration.
+            # Symmetric-memory registration is scoped to the collective's process
+            # group, so rendezvous the output on the same mesh axis as the all-gather.
+            if out.is_symmetric_memory:
+                out.rendezvous(mesh_axis)
+            dist.all_gather_into_tensor(
+                output_tensor=out.local_buffer, input_tensor=self.local_buffer, group=group
+            )
+        else:
+            # Uneven all_gather uses grouped NCCL broadcasts, which cannot use
+            # symmetric-memory kernels: https://github.com/pytorch/pytorch/issues/198344.
+            if out.is_symmetric_memory:
+                warnings.warn(
+                    "DBuffer.allgather() with unequal shard sizes cannot use symmetric-memory "
+                    "kernels; falling back to grouped NCCL broadcasts.",
+                    stacklevel=2,
+                )
+            # Non-uniform segments: ``out`` spans the whole global buffer (without padding) and the
+            # layout's rank segments index it directly.
+            chunks = [
+                out.local_buffer.narrow(
+                    0, self.layout.rank_to_offset[rank], self.layout.rank_size(rank)
+                )
+                for rank in range(self.layout.dp_size)
+            ]
+            dist.all_gather(chunks, self.local_buffer, group=group)
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
@@ -515,21 +544,36 @@ class DBuffer:
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = _get_reduce_op(partial_placement)
-        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
-        # reductions remain supported on older PyTorch versions that lack it.
+        group = self.mesh.get_group(axis)
         if self.is_symmetric_memory:
+            # Uneven reduce_scatter uses grouped NCCL reduces, which cannot use
+            # symmetric-memory kernels: https://github.com/pytorch/pytorch/issues/198344.
+            if not self.layout.has_equal_shard_sizes:
+                raise NotImplementedError(
+                    "Symmetric-memory reduce_scatter() requires equal shard sizes."
+                )
             self.rendezvous(axis)
             # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
             # for SUM. Preserve the placement's AVG semantics by scaling the
             # SUM result after the collective.
             if reduce_op == dist.ReduceOp.AVG:
                 reduce_op = dist.ReduceOp.SUM
-        dist.reduce_scatter_tensor(
-            output=out.local_buffer,
-            input=self.local_buffer,
-            op=reduce_op,
-            group=self.mesh.get_group(axis),
-        )
+
+        if self.layout.has_equal_shard_sizes:
+            dist.reduce_scatter_tensor(
+                output=out.local_buffer, input=self.local_buffer, op=reduce_op, group=group
+            )
+        else:
+            # Non-uniform segments: the Partial input spans the whole global
+            # buffer (without padding), so the layout's rank segments index it directly.
+            chunks = [
+                self.local_buffer.narrow(
+                    0, self.layout.rank_to_offset[rank], self.layout.rank_size(rank)
+                )
+                for rank in range(self.layout.dp_size)
+            ]
+            dist.reduce_scatter(out.local_buffer, chunks, op=reduce_op, group=group)
+
         if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))
         return out
